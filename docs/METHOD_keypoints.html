@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Method: Stereo Needle Keypoint &amp; 6-DoF Pose Estimation</title>
+<style>
+  body{margin:0;color:#1a1a1a;background:#fff;
+       font-family:"Times New Roman",Georgia,serif;line-height:1.65}
+  .wrap{max-width:880px;margin:0 auto;padding:36px 26px 90px}
+  h1{font-size:25px;margin:0 0 4px}
+  .sub{color:#555;font-style:italic;margin:0 0 26px}
+  h2{font-size:19px;border-bottom:1px solid #ccc;padding-bottom:4px;margin:30px 0 12px}
+  h3{font-size:16px;margin:18px 0 6px}
+  p,li,td,th{font-size:15.5px}
+  code,.sym{font-family:"Cambria Math","Latin Modern Math",Georgia,serif;font-style:italic}
+  .eq{margin:10px 0 10px 24px}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-family:Georgia,serif}
+  th,td{border:1px solid #ccc;padding:6px 9px;text-align:left;vertical-align:top;font-size:14.5px}
+  th{background:#f0f0f0}
+  .mono{font-family:Consolas,monospace;font-style:normal;font-size:13px}
+  .note{color:#444;font-size:14px}
+</style>
+</head>
+<body><div class="wrap">
+
+<h1>Stereo Needle Keypoint and 6-DoF Pose Estimation in Surgical Video</h1>
+<p class="sub">Method description — multi-class segmentation, rule-based stereo keypoint extraction,
+a learnable heatmap detector, and rigid-arc pose recovery.</p>
+
+<h2>1. Overview</h2>
+<p>Given a calibrated binocular endoscopic stream, we estimate <span class="sym">N</span> equally
+spaced keypoints along the visible needle centerline (tip→tail) and the rigid 6-DoF pose of the
+needle. A semantic segmentation network provides per-pixel class masks; a geometric module then
+reconstructs the needle as a planar circular arc, samples keypoints by arc length, triangulates them
+across the stereo pair, and recovers the pose. A learnable heatmap detector is trained on the
+geometric module's (human-verified) output to provide a mask-independent, real-time alternative.</p>
+
+<h2>2. Notation</h2>
+<table>
+  <tr><th>Symbol</th><th>Name</th><th>Space / Dimension</th></tr>
+  <tr><td class="sym">I<sub>L</sub>, I<sub>R</sub></td><td>Left / right images</td><td class="mono">ℝ^(H×W×3)</td></tr>
+  <tr><td class="sym">M<sub>L</sub>, M<sub>R</sub></td><td>Class label maps (0=bg,1=needle,2=thread,3=clamps)</td><td class="mono">{0,…,C−1}^(H×W)</td></tr>
+  <tr><td class="sym">C</td><td>Number of semantic classes</td><td class="mono">ℤ⁺ (=4)</td></tr>
+  <tr><td class="sym">K<sub>1</sub>, K<sub>2</sub></td><td>Camera intrinsic matrices (left, right)</td><td class="mono">ℝ^(3×3)</td></tr>
+  <tr><td class="sym">D<sub>1</sub>, D<sub>2</sub></td><td>Lens distortion coefficients</td><td class="mono">ℝ⁵</td></tr>
+  <tr><td class="sym">R, t</td><td>Stereo extrinsics, cam1→cam2</td><td class="mono">SO(3), ℝ³ (mm)</td></tr>
+  <tr><td class="sym">P<sub>1</sub>, P<sub>2</sub></td><td>Projection matrices, P<sub>1</sub>=K<sub>1</sub>[I|0], P<sub>2</sub>=K<sub>2</sub>[R|t]</td><td class="mono">ℝ^(3×4)</td></tr>
+  <tr><td class="sym">𝒞<sub>L</sub>, 𝒞<sub>R</sub></td><td>Ordered needle centerline polylines (per view)</td><td class="mono">ℝ^(m×2)</td></tr>
+  <tr><td class="sym">N</td><td>Number of keypoints (tip…tail)</td><td class="mono">ℤ⁺ (=5)</td></tr>
+  <tr><td class="sym">p<sub>i</sub><sup>L</sup>, p<sub>i</sub><sup>R</sup></td><td>i-th keypoint, 2D pixel (left, right)</td><td class="mono">ℝ²</td></tr>
+  <tr><td class="sym">X<sub>i</sub></td><td>i-th keypoint, 3D in cam1 frame</td><td class="mono">ℝ³ (mm)</td></tr>
+  <tr><td class="sym">o, n, ρ</td><td>Fitted arc: center, unit plane normal, radius</td><td class="mono">ℝ³, 𝕊², ℝ⁺</td></tr>
+  <tr><td class="sym">(R<sub>o</sub>, t<sub>o</sub>)</td><td>Object 6-DoF pose (rotation, translation)</td><td class="mono">SO(3), ℝ³</td></tr>
+  <tr><td class="sym">𝐇</td><td>Predicted keypoint heatmaps</td><td class="mono">ℝ^(K×h×w)</td></tr>
+  <tr><td class="sym">K</td><td>Heatmap channels = N + 1 (needle + claw-tip)</td><td class="mono">ℤ⁺</td></tr>
+  <tr><td class="sym">s, σ</td><td>Heatmap stride, Gaussian std</td><td class="mono">ℤ⁺, ℝ⁺</td></tr>
+</table>
+
+<h2>3. Stereo Geometry</h2>
+<p>Pixels are undistorted with (K, D). A 2D point <span class="sym">p</span> is back-projected and a
+3D point is obtained by linear triangulation of the corresponding rays:</p>
+<p class="eq"><span class="sym">X = Triangulate(P<sub>1</sub>, P<sub>2</sub>, p<sup>L</sup>, p<sup>R</sup>)</span>,
+solving <span class="sym">p<sup>L</sup> × (P<sub>1</sub>X) = 0</span>, <span class="sym">p<sup>R</sup> × (P<sub>2</sub>X) = 0</span> (DLT).</p>
+<p class="note">All 3D quantities are metric (mm) since ‖t‖ is the physical baseline.</p>
+
+<h2>4. Per-view Needle Centerline</h2>
+<p>From the needle mask <span class="sym">M<sub>v</sub>=1</span> (view <span class="sym">v∈{L,R}</span>) the
+centerline is reconstructed as a single planar arc, robust to occlusion that fragments the mask:</p>
+<ol>
+  <li>Collect skeleton pixels from <em>all</em> connected components of the needle mask.</li>
+  <li>Robustly fit one ellipse <span class="sym">ℰ<sub>v</sub></span> (RANSAC/trimmed least squares),
+      rejecting outlier blobs.</li>
+  <li>Order inlier points by ellipse angle; remove the largest angular gap; resample the spanned arc to
+      obtain the ordered, gap-filled centerline <span class="sym">𝒞<sub>v</sub></span> (occluded segments
+      are interpolated along the arc).</li>
+</ol>
+<p>Tip/tail orientation: the endpoint nearest the suture-thread mask (class 2) is the <em>tail</em>; the
+opposite endpoint is the <em>tip</em>. A swage-thickness fallback (distance transform) is used when the
+thread is not visible.</p>
+
+<h2>5. Equally-spaced Keypoints</h2>
+<p>Each view's centerline is resampled at equal arc-length fractions to give <span class="sym">N</span>
+ordered points (tip→tail):</p>
+<p class="eq"><span class="sym">p<sub>i</sub><sup>v</sup> = 𝒞<sub>v</sub>(u<sub>i</sub>)</span>,
+&nbsp; <span class="sym">u<sub>i</sub> = i/(N−1)·L<sub>v</sub></span>,
+&nbsp; <span class="sym">i = 0,…,N−1</span>, where <span class="sym">L<sub>v</sub></span> is the
+polyline length. Spacing is uniform along the centerline regardless of occlusion.</p>
+
+<h2>6. 3D Keypoints</h2>
+<p>The matched samples are triangulated by index:
+<span class="sym">X<sub>i</sub> = Triangulate(P<sub>1</sub>,P<sub>2</sub>, undistort(p<sub>i</sub><sup>L</sup>), undistort(p<sub>i</sub><sup>R</sup>))</span>.
+A visibility flag <span class="sym">v<sub>i</sub>∈{0,1}</span> marks whether <span class="sym">p<sub>i</sub></span>
+lies inside the observed mask (1) or on a reconstructed/occluded segment (0).</p>
+
+<h2>7. 6-DoF Pose (Rigid Planar Arc)</h2>
+<p>The needle is a rigid planar circular arc, so its pose is fully defined by the fitted 3D circle.
+Fitting <span class="sym">{X<sub>i</sub>}</span> by SVD gives a plane (normal <span class="sym">n</span>),
+in-plane circle center <span class="sym">o</span> and radius <span class="sym">ρ</span>. The object frame is</p>
+<p class="eq">
+<span class="sym">e<sub>z</sub> = n</span> (sign-fixed so <span class="sym">n<sub>z</sub>&lt;0</span>, facing the camera),
+&nbsp; <span class="sym">e<sub>x</sub> = Π<sub>n</sub>(X<sub>tip</sub>−o)/‖·‖</span>,
+&nbsp; <span class="sym">e<sub>y</sub> = e<sub>z</sub>×e<sub>x</sub></span>,
+</p>
+<p class="eq"><span class="sym">R<sub>o</sub> = [e<sub>x</sub> e<sub>y</sub> e<sub>z</sub>] ∈ SO(3)</span>,
+&nbsp; <span class="sym">t<sub>o</sub> = o ∈ ℝ³</span>,
+&nbsp; output also as a rotation vector <span class="sym">r = log(R<sub>o</sub>) ∈ ℝ³</span> (Rodrigues),</p>
+<p>where <span class="sym">Π<sub>n</sub></span> projects onto the arc plane. A constant-velocity Kalman
+filter on <span class="sym">(t<sub>o</sub>, r) ∈ ℝ⁶</span> (12-state, predict/correct) temporally smooths
+the pose and coasts through frames without a detection.</p>
+
+<h2>8. Learnable Keypoint Detector</h2>
+<h3>8.1 Architecture</h3>
+<p>The same DINOv2 (ViT) encoder + DPT dense head as the segmentation model, with the output layer
+producing <span class="sym">K=N+1</span> heatmap channels: <span class="sym">N</span> single-peak needle
+channels (tip…tail, fixed identity) and one multi-peak claw-tip channel. Input
+<span class="sym">I∈ℝ^(3×W₀×W₀)</span> (resized to a multiple of the patch size 14); output
+<span class="sym">𝐇∈ℝ^(K×h×w)</span>, <span class="sym">h=w=W₀/s</span>.</p>
+<h3>8.2 Targets and Loss</h3>
+<p>For a labelled keypoint at <span class="sym">(x,y)</span> the target channel holds a Gaussian
+<span class="sym">G(·)=exp(−‖·−(x,y)/s‖²/2σ²)</span>. Channels with no keypoint carry weight 0.
+Training minimizes a channel-weighted MSE:</p>
+<p class="eq"><span class="sym">ℒ = ( Σ<sub>k</sub> w<sub>k</sub>·MSE(𝐇<sub>k</sub>, G<sub>k</sub>) ) / Σ<sub>k</sub> w<sub>k</sub></span>,
+&nbsp; <span class="sym">w<sub>k</sub>∈{0,1}</span>.</p>
+<h3>8.3 Training configuration</h3>
+<table>
+  <tr><th>Item</th><th>Setting</th></tr>
+  <tr><td>Optimizer</td><td>AdamW, weight decay 0.01</td></tr>
+  <tr><td>Learning rate</td><td>head 1×10⁻⁴, backbone 1×10⁻⁵ (mult 0.1); cosine decay to 1% </td></tr>
+  <tr><td>Precision / stability</td><td>fp16 AMP (GradScaler), grad-norm clip 5.0, TF32</td></tr>
+  <tr><td>Input / heatmap</td><td>crop W₀=490 (=14·35), stride s=4 (h=w=122), σ=2</td></tr>
+  <tr><td>Augmentation</td><td>photometric color-jitter (train only; keypoints unchanged)</td></tr>
+  <tr><td>Split</td><td>per-video temporal 8:2 (last 20% → val), both views as samples</td></tr>
+</table>
+<h3>8.4 Inference (hybrid)</h3>
+<p>Per view, peaks are decoded from <span class="sym">𝐇</span> (arg-max for needle channels; threshold +
+non-max suppression for the claw channel). Needle keypoints correspond across views by channel identity
+and are triangulated (§6); the 6-DoF pose follows (§7). The detector is mask-free at run time; the
+geometric module remains the auto-labeler and the 3D/pose refiner.</p>
+
+<h2>9. Real-time Pipeline and Metrics</h2>
+<p>Each stereo frame is segmented (both eyes in one batched fp16 forward), processed to keypoints + pose,
+and displayed with the instantaneous frame rate. Accuracy is reported against the (verified) reference
+sidecars: per-keypoint left-view pixel error, PCK@τ (fraction with error ≤ τ px), and 3D error (mm) when
+3D references exist.</p>
+
+<p class="note">Limitations. The stereo baseline is small, so the fitted radius and plane normal — hence
+absolute 3D/pose magnitude — are sensitive; argmax keypoint <em>locations</em> and the temporally
+filtered pose remain stable. Rule-based claw localization is bounded by mask coverage of the thin
+reflective jaw tips; the learnable detector mitigates this once trained on corrected labels.</p>
+
+</div></body></html>

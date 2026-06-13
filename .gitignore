@@ -1,0 +1,6 @@
+
+*.pt
+*.ts.pt
+*.mp4
+weights/
+

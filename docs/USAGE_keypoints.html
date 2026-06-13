@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>关键点检测 · 使用说明</title>
+<style>
+  body{margin:0;color:#1c2430;background:#f6f8fa;
+       font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.7}
+  .wrap{max-width:860px;margin:0 auto;padding:0 22px 80px}
+  header{background:linear-gradient(120deg,#0d2a4a,#1f6feb);color:#fff;padding:26px 0}
+  header .wrap{padding-top:0;padding-bottom:0}
+  h1{margin:0;font-size:22px}
+  header p{margin:4px 0 0;opacity:.9;font-size:14px}
+  h2{font-size:18px;border-left:4px solid #1f6feb;padding-left:10px;margin:26px 0 10px}
+  code{background:#eef1f5;color:#b3261e;padding:1px 5px;border-radius:4px;font-size:90%}
+  pre{background:#0d1117;color:#d6dee8;padding:13px 15px;border-radius:8px;overflow:auto;font-size:13px;line-height:1.5}
+  table{border-collapse:collapse;width:100%;margin:10px 0;background:#fff;font-size:14px}
+  th,td{border:1px solid #e2e6ec;padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#eef3fb}
+  .tip{background:#eaf5ff;border-left:4px solid #1f6feb;padding:9px 13px;border-radius:0 6px 6px 0;margin:10px 0;font-size:14px}
+  .warn{background:#fff8e6;border-left:4px solid #f0b429;padding:9px 13px;border-radius:0 6px 6px 0;margin:10px 0;font-size:14px}
+  ol{padding-left:22px}
+</style>
+</head>
+<body>
+<header><div class="wrap">
+  <h1>双目关键点检测 · 使用说明</h1>
+  <p>实时检测针体 N 个关键点的三维坐标与 6D 位姿，并显示帧率</p>
+</div></header>
+<div class="wrap">
+
+<h2>0. 先设好路径变量</h2>
+<p>打开终端，按你的实际路径粘贴一次（标 ✏️ 处改成自己的）：</p>
+<pre>DATA=/root/autodl-tmp/data/surgical_seg            # ✏️ 数据目录
+UNI=/root/autodl-tmp/code/UniMatch-V2_local        # ✏️ 代码目录
+CKPT=$UNI/exp/combined_r100_base/best.pth          # ✏️ 分割模型权重
+CALIB=/root/autodl-tmp/code/SAM2-Plus/tools/needle_calib.json   # 标定文件
+cd $UNI</pre>
+
+<h2>1. 三种输入方式（任选其一）</h2>
+<table>
+  <tr><th>输入</th><th>在命令里加这些参数</th></tr>
+  <tr><td>① 采集卡（一个设备，左右并排画面）</td><td><code>--capture 0 --layout sbs</code></td></tr>
+  <tr><td>② 视频文件（左右各一个）</td><td><code>--left 左.mp4 --right 右.mp4</code></td></tr>
+  <tr><td>③ 已有数据集序列（按帧回放）</td><td><code>--root $DATA --dataset march_1 --key 1_01</code></td></tr>
+</table>
+<p class="tip">采集卡若是上下排列画面用 <code>--layout tb</code>。两台相机也可写成 <code>--left 0 --right 1</code>。</p>
+
+<h2>2. 运行（实时显示 + 保存结果）</h2>
+<p><b>示例：采集卡输入</b></p>
+<pre>python realtime_stereo_keypoints.py \
+  --config configs/surgical_combined.yaml --checkpoint $CKPT --calib $CALIB \
+  --capture 0 --layout sbs \
+  --num-keypoints 5 --seg-size 640 \
+  --save-video /root/autodl-tmp/exp/out.mp4 \
+  --save-results /root/autodl-tmp/exp/result.jsonl</pre>
+<p><b>示例：视频文件输入</b> — 把上面的 <code>--capture 0 --layout sbs</code> 换成 <code>--left 左.mp4 --right 右.mp4</code>。</p>
+<p><b>示例：数据集回放输入</b> — 换成 <code>--root $DATA --dataset march_1 --key 1_01</code>。</p>
+<ul>
+  <li><code>--num-keypoints 5</code>：输出几个等距关键点（可改）。</li>
+  <li><code>--save-video 文件.mp4</code>：录制可视化（<b>服务器无界面时用这个看效果</b>）。</li>
+  <li><code>--save-results 文件.jsonl</code>：<b>三种输入都会逐帧保存结果</b>，供后续算指标。</li>
+  <li><code>--show</code>：弹窗实时显示（<b>仅在有显示器 / VNC 的机器上用</b>；纯命令行服务器会报 Qt 错误，别加）。</li>
+</ul>
+
+<h2>3. 屏幕会显示什么</h2>
+<ul>
+  <li>左右并排画面，针体上标出 N 个关键点（针尖绿、针尾红、中间黄）。</li>
+  <li>左上角：<b>实时帧率 FPS</b>。</li>
+  <li>下方两行：物体 <b>6D 位姿</b>——平移 <code>t=(x,y,z)mm</code> 与旋转 <code>rot=(x,y,z)deg</code>（欧拉角）。</li>
+  <li><b>位姿验证（反投影）</b>：每个视图画出物体坐标轴（X 红 / Y 绿 / Z 蓝），并把三维关键点反投影成<b>白色圈</b>。
+      白圈若压在检测点上、左右都对齐，说明位姿/三维可信。（不想要可加 <code>--no-reproject</code>）</li>
+  <li>结果文件：<code>--save-results out.jsonl</code> 存每帧关键点三维坐标 + 完整位姿 <code>{R,t,rvec}</code>；
+      <code>--save-poses out.csv</code> 另存 <code>t / rvec / 旋转矩阵 R(9) / 欧拉角</code>（带表头）。</li>
+</ul>
+
+<h2>4. 显存 / 速度调节</h2>
+<table>
+  <tr><th>需求</th><th>怎么做</th></tr>
+  <tr><td>显存不够（要 &lt;4G）</td><td>调小 <code>--seg-size</code>：640 → 512 → 448</td></tr>
+  <tr><td>想更快（首选）</td><td>用 <b>small 模型</b>：<code>--config configs/surgical_combined_small.yaml --checkpoint exp/combined_r100_small/best.pth</code>（约快 3~4×）</td></tr>
+  <tr><td>想更快（其次）</td><td>调小 <code>--seg-size</code>（默认已开 fp16 + 左右合批加速）</td></tr>
+  <tr><td>想更清晰（细针细线）</td><td>调大 <code>--seg-size</code>：768 / 896</td></tr>
+  <tr><td>位姿抖动</td><td>默认已开卡尔曼平滑；如需关闭加 <code>--no-smooth</code></td></tr>
+</table>
+
+<h2>5. 数据集回放：自动算精度</h2>
+<p>用 ③ 数据集输入，并以之前生成的关键点作真值，跑完自动打印指标（像素误差 / PCK / 三维误差）：</p>
+<pre>python realtime_stereo_keypoints.py \
+  --config configs/surgical_combined.yaml --checkpoint $CKPT --calib $CALIB \
+  --root $DATA --dataset march_1 --key 1_01 \
+  --num-keypoints 5 --seg-size 640 \
+  --gt-subdir keypoints --pck-thresh 10 \
+  --save-video /root/autodl-tmp/exp/verify.mp4 \
+  --save-results /root/autodl-tmp/exp/result.jsonl</pre>
+
+<div class="warn"><b>常见问题</b><br>
+• 弹不出窗口/无界面：需要桌面或 VNC 环境；纯命令行服务器请去掉 <code>--show</code>，改用 <code>--save-video</code> 录像查看。<br>
+• 报 <code>CUDA out of memory</code>：把 <code>--seg-size</code> 调小。<br>
+• 报找不到文件：检查 <code>$DATA</code>/<code>$CKPT</code>/<code>$CALIB</code> 路径是否填对、是否在同一个终端里设过变量。
+</div>
+
+</div>
+</body>
+</html>
