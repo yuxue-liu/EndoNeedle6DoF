@@ -99,6 +99,41 @@ The segmentation network is released as a fixed-shape TorchScript engine,
 long-side of 640. The engine is hardware- and shape-specific; to target a different GPU or
 input size, re-export with `inference/export_seg_engine.py`.
 
+## Model Weights
+
+Large checkpoints are distributed as release assets on the
+[Releases](https://github.com/yuxue-liu/EndoNeedle6DoF/releases) page rather than tracked in
+the repository.
+
+| Asset | Description | Approx. size |
+|---|---|---|
+| `weights/seg_engine_640.ts` | DINOv2-base + DPT segmentation engine (included in the repository) | 190 MB |
+| `best.pth` | DINOv2-base + DPT segmentation checkpoint (full precision) | 370 MB |
+| `checkpoint_phase123.pt` | SAM2-Plus annotation predictor checkpoint | 760 MB |
+
+```bash
+mkdir -p checkpoints
+curl -L -o checkpoints/checkpoint_phase123.pt \
+  https://github.com/yuxue-liu/EndoNeedle6DoF/releases/download/v1.0/checkpoint_phase123.pt
+curl -L -o weights/best.pth \
+  https://github.com/yuxue-liu/EndoNeedle6DoF/releases/download/v1.0/best.pth
+```
+
+## Annotation
+
+The interactive annotator (`annotation/`) is built on the SAM2-Plus video predictor packaged
+in `sam2_plus/`: point/brush multi-class labeling with forward video propagation and
+pause-resume correction. After downloading `checkpoint_phase123.pt`:
+
+```bash
+python annotation/app_gui.py \
+  --image_dir <frames_dir> \
+  --checkpoint checkpoints/checkpoint_phase123.pt
+```
+
+Stereo and dual-view correction variants (`app_gui_stereo.py`, `app_gui_dual.py`) follow the
+same invocation.
+
 ## Quick Start
 
 ### Encapsulated inference (recommended)
@@ -143,9 +178,10 @@ confidence), and an optional flattened CSV of poses. Full parameter documentatio
 
 ## Release Scope
 
-This repository distributes inference and annotation components only. Model training,
-semi-supervised learning code, custom architectural modules, and raw checkpoints are not
-included; the segmentation model is provided exclusively as a compiled TorchScript engine.
+This repository provides the segmentation engine and full-precision checkpoint, the
+stereo-needle inference pipeline, and the SAM2-Plus annotation toolkit with its predictor
+package and checkpoint. The UniMatch-V2 training code and the auxiliary segmentation modules
+used in our experiments are not part of this release.
 
 ## Citation
 
