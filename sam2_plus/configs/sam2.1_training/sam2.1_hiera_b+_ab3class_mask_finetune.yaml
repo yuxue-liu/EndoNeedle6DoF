@@ -1,0 +1,89 @@
+# @package _global_
+#
+# Mask-only fine-tune of SAM2-Plus on the a/b suturing dataset (3 classes).
+#
+# The a/b annotation lives in ab_dataset with nested keys + non-numeric frame
+# names, which PNGRawDataset cannot read. First build a VOS view with:
+#   python tools/ab_to_vos.py --ab-root <ab_dataset> --out-root <ab_dataset_vos>
+# then point `root` below at that VOS view.
+#
+# Run:
+#   cd /root/autodl-tmp/code/SAM2-Plus
+#   export PYTHONPATH=$PWD:$PYTHONPATH
+#   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#   python training/train.py \
+#     --config configs/sam2.1_training/sam2.1_hiera_b+_ab3class_mask_finetune.yaml \
+#     --config-module sam2_plus --use-cluster 0 --num-gpus 1
+
+defaults:
+  - sam2.1_hiera_b+_predmasks_decoupled_MAME_mixtraining_threetasks
+  - _self_
+
+# TODO: set to the VOS view produced by tools/ab_to_vos.py
+root: /root/autodl-tmp/code/ab_dataset_vos
+
+scratch:
+  num_epochs: 40
+  train_batch_size: 1
+  resolution: 512
+  num_frames: 4
+  num_train_workers: 6
+  max_num_objects: 3          # a/b dataset has 3 foreground classes (cls=[1,2,3])
+  base_lr: 2.0e-05
+  vision_lr: 2.0e-06
+
+trainer:
+  data:
+    train:
+      batch_sizes:
+        - ${scratch.train_batch_size}
+      datasets:
+        - _target_: training.dataset.vos_dataset.VOSDataset
+          transforms: ${vos.train_transforms}
+          training: true
+          video_dataset:
+            _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+            img_folder: ${root}/images
+            gt_folder: ${root}/masks
+            file_list_txt: ${root}/ImageSets/train.txt
+            is_palette: true
+          sampler:
+            _target_: training.dataset.vos_sampler.RandomUniformSampler
+            num_frames: ${scratch.num_frames}
+            max_num_objects: ${scratch.max_num_objects}
+          multiplier: 1
+      dataset_prob: [1.0]
+
+    val:
+      batch_sizes:
+        - ${scratch.train_batch_size}
+      datasets:
+        - _target_: training.dataset.vos_dataset.VOSDataset
+          transforms: ${vos.train_transforms}
+          training: true
+          video_dataset:
+            _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+            img_folder: ${root}/images
+            gt_folder: ${root}/masks
+            file_list_txt: ${root}/ImageSets/valid.txt
+            is_palette: true
+          sampler:
+            _target_: training.dataset.vos_sampler.RandomUniformSampler
+            num_frames: ${scratch.num_frames}
+            max_num_objects: ${scratch.max_num_objects}
+          multiplier: 1
+      dataset_prob: [1.0]
+
+  checkpoint:
+    model_weight_initializer:
+      strict: False
+      ignore_missing_keys: null
+      ignore_unexpected_keys: null
+      state_dict:
+        checkpoint_path: /root/autodl-tmp/code/SAM2-Plus/checkpoints/checkpoint_phase123.pt
+        ckpt_state_dict_keys: ['model']
+        checkpoint_kernels: []
+
+launcher:
+  num_nodes: 1
+  gpus_per_node: 1

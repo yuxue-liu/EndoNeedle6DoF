@@ -1,0 +1,96 @@
+# @package _global_
+#
+# Mask-only fine-tune of SAM2-Plus on surgical VOS sequences.
+#
+# Inherits the full model / optim / loss / PEFT stack from the three-task base
+# config, and overrides ONLY:
+#   * root + data: a single mask (VOS) dataset, no box/point branches
+#   * checkpoint: init from checkpoint_phase123.pt (already SAM2-Plus format)
+#     with the base->plus rename/exclude kernels REMOVED
+#   * schedule: fewer epochs, single GPU
+#
+# Run:
+#   cd /root/autodl-tmp/code/SAM2-Plus
+#   export PYTHONPATH=$PWD:$PYTHONPATH
+#   python training/train.py \
+#     --config configs/sam2.1_training/sam2.1_hiera_b+_needle3class_mask_finetune.yaml \
+#     --config-module sam2_plus --use-cluster 0 --num-gpus 1
+#
+# First generate the splits with tools/prepare_vos_finetune_split.py, and set
+# `root` + the img_folder/gt_folder below to match its printed paths.
+
+defaults:
+  - sam2.1_hiera_b+_predmasks_decoupled_MAME_mixtraining_threetasks
+  - _self_
+
+# Dataset root (confirmed via prepare_vos_finetune_split.py)
+root: /root/autodl-tmp/data/autonomous_surgery/public_data/unimatchv2_needle_3class
+
+scratch:
+  num_epochs: 40
+  train_batch_size: 1
+  resolution: 512             # OOM fix: 1024->512 cuts activation memory ~4x
+  num_frames: 4               # OOM fix: 8->4 fewer activations held across the clip
+  num_train_workers: 6
+  max_num_objects: 2          # = number of foreground classes (needle3class)
+  base_lr: 2.0e-05            # lower LR for fine-tuning
+  vision_lr: 2.0e-06
+
+trainer:
+  data:
+    train:
+      batch_sizes:
+        - ${scratch.train_batch_size}
+      datasets:
+        - _target_: training.dataset.vos_dataset.VOSDataset
+          transforms: ${vos.train_transforms}
+          training: true
+          video_dataset:
+            _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+            img_folder: ${root}/images      # confirmed by prepare script
+            gt_folder: ${root}/masks        # confirmed by prepare script
+            file_list_txt: ${root}/ImageSets/train.txt
+            is_palette: true                # index PNGs (0=bg, 1..N=class)
+          sampler:
+            _target_: training.dataset.vos_sampler.RandomUniformSampler
+            num_frames: ${scratch.num_frames}
+            max_num_objects: ${scratch.max_num_objects}
+          multiplier: 1
+      dataset_prob: [1.0]
+
+    val:
+      batch_sizes:
+        - ${scratch.train_batch_size}
+      datasets:
+        - _target_: training.dataset.vos_dataset.VOSDataset
+          transforms: ${vos.train_transforms}
+          training: true
+          video_dataset:
+            _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+            img_folder: ${root}/images      # confirmed by prepare script
+            gt_folder: ${root}/masks        # confirmed by prepare script
+            file_list_txt: ${root}/ImageSets/valid.txt
+            is_palette: true
+          sampler:
+            _target_: training.dataset.vos_sampler.RandomUniformSampler
+            num_frames: ${scratch.num_frames}
+            max_num_objects: ${scratch.max_num_objects}
+          multiplier: 1
+      dataset_prob: [1.0]
+
+  checkpoint:
+    # Init from the already-trained SAM2-Plus checkpoint. It is already in the
+    # decoupled "plus" key layout, so the base->plus conversion kernels are
+    # dropped and we load non-strict to tolerate PEFT/optimizer differences.
+    model_weight_initializer:
+      strict: False
+      ignore_missing_keys: null
+      ignore_unexpected_keys: null
+      state_dict:
+        checkpoint_path: /root/autodl-tmp/code/SAM2-Plus/checkpoints/checkpoint_phase123.pt
+        ckpt_state_dict_keys: ['model']   # TODO: confirm top-level key in phase123 .pt
+        checkpoint_kernels: []            # IMPORTANT: no rename/exclude for a plus-format ckpt
+
+launcher:
+  num_nodes: 1
+  gpus_per_node: 1
