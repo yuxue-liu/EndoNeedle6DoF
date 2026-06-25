@@ -35,6 +35,21 @@ import threading
 import torch
 
 
+def _add_trt_dll_dir():
+    """Windows: torch_tensorrt's torchtrt.dll links the TensorRT runtime DLLs
+    (nvinfer_10.dll, ...) which ship in the `tensorrt_libs` package directory and
+    are NOT on PATH by default -> importing torch_tensorrt fails with
+    'WinError 127 (procedure/module not found)'. Put that dir on the DLL search
+    path before any torch_tensorrt import. No-op off Windows / if not installed."""
+    if os.name != 'nt':
+        return
+    try:
+        import tensorrt_libs
+        os.add_dll_directory(os.path.dirname(tensorrt_libs.__file__))
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------- #
 # step 6: pre-exported accelerated segmentation backend
 # --------------------------------------------------------------------------- #
@@ -51,31 +66,64 @@ class _HalfInputEngine(torch.nn.Module):
         return self.engine(x.half())
 
 
-def load_seg_engine(path, device):
-    """Load a TorchScript / Torch-TensorRT engine saved by export_seg_engine.py.
+class _FloatInputEngine(torch.nn.Module):
+    """Cast the input to fp32 before calling the engine. FP32 engines built by
+    export_seg_engine_fp32.py (TorchScript .float() or Torch-TensorRT FP32)
+    declare float32 inputs, but the caller (seg_masks_batch) may hand a tensor of
+    a different dtype, so we normalize here. Keeps the drop-in model(x)->logits
+    contract. Used on tensor-core-less GPUs where FP16 has no fast path."""
+    def __init__(self, engine):
+        super().__init__()
+        self.engine = engine
+
+    def forward(self, x):
+        return self.engine(x.float())
+
+
+def _engine_is_fp32(path):
+    """Heuristic: an engine whose filename carries an fp32 marker expects float32
+    input. Covers both the plain TorchScript-FP32 engines (seg_engine_fp32_*.ts)
+    and the new TRT-FP32 engines (seg_engine_trtfp32_*.ts)."""
+    return 'fp32' in os.path.basename(path).lower()
+
+
+def load_seg_engine(path, device, precision='auto'):
+    """Load a TorchScript / Torch-TensorRT engine saved by export_seg_engine*.py.
 
     Returns an nn.Module-like object whose forward(x: (B,3,H,W)) -> logits
-    (B, nclass, mh, mw), i.e. a drop-in replacement for bundle['model']."""
+    (B, nclass, mh, mw), i.e. a drop-in replacement for bundle['model'].
+
+    precision controls the dtype the input is cast to before the engine runs:
+      'fp16'  -> always cast to half (legacy export_seg_engine.py engines)
+      'fp32'  -> always cast to float (export_seg_engine_fp32.py engines)
+      'auto'  -> fp32 if the filename has an 'fp32' marker, else fp16 (default,
+                 backward compatible: existing fp16 engines keep half input)."""
     if not os.path.isfile(path):
         raise FileNotFoundError(f"seg engine not found: {path}")
     # torch_tensorrt engines deserialize through torch.jit and need the runtime
     # registered; import it if present (harmless if the engine is plain TS).
     try:
+        _add_trt_dll_dir()
         import torch_tensorrt  # noqa: F401
     except Exception:
         pass
     m = torch.jit.load(path, map_location=device).eval()
+    if precision == 'auto':
+        precision = 'fp32' if _engine_is_fp32(path) else 'fp16'
+    if precision == 'fp32':
+        print(f'[accel] engine input precision = fp32 ({os.path.basename(path)})')
+        return _FloatInputEngine(m)
     return _HalfInputEngine(m)
 
 
-def attach_engine_to_bundle(bundle, engine_path, device):
+def attach_engine_to_bundle(bundle, engine_path, device, precision='auto'):
     """Swap a pre-exported engine in for bundle['model'] so seg_masks_batch uses
     it transparently. Requires the plain batched forward (no affinity/edge head)."""
     if bundle.get('affinity_side') is not None or bundle.get('use_edge_enhance'):
         print('[accel] WARNING: model has affinity/edge head -> batched forward is '
               'bypassed; the engine will NOT be used. Export/run a plain seg model.')
         return bundle
-    bundle['model'] = load_seg_engine(engine_path, device)
+    bundle['model'] = load_seg_engine(engine_path, device, precision=precision)
     print(f'[accel] segmentation backend = pre-exported engine: {engine_path}')
     return bundle
 

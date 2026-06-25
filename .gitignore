@@ -1,12 +1,18 @@
-
+# Large model weights — shipped via GitHub Releases, not git
 *.pt
 *.ts.pt
-*.mp4
 weights/
 
-
-*.pt
-*.ts.pt
+# Test / scratch artifacts
 *.mp4
-weights/
+*.jsonl
+__pycache__/
+*.pyc
+results/
+results_remote/
 
+# Private server-orchestration / dev sweep tooling (not part of the public release)
+remote_probe.py
+remote_run_speed_accuracy_sweep.py
+remote_run_split_stage_sweep.py
+summarize_speed_accuracy_sweep.py

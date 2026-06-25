@@ -108,10 +108,17 @@ class StereoSource:
 
 
 # ----------------------------------------------------------------- seg via engine
-def seg_engine_batch(engine, bgrs, seg_size, device, patch=14):
+def seg_engine_batch(engine, bgrs, seg_size, device, patch=14, prof=None):
     """Preprocess BOTH eyes exactly like the full pipeline's seg_masks_batch, run
     one engine forward, return per-eye uint8 label maps at the source resolution.
-    The engine forward shape must equal what export_seg_engine.py built."""
+    The engine forward shape must equal what export_seg_engine.py built.
+
+    If `prof` (a dict) is given, accumulates wall-clock seconds for the 'pre',
+    'fwd' and 'post' sub-stages (CUDA-synchronized so the timings are real)."""
+    def _sync():
+        if prof is not None and device.type == 'cuda':
+            torch.cuda.synchronize()
+
     H, W = bgrs[0].shape[:2]
     if seg_size and max(H, W) > seg_size:
         s = seg_size / float(max(H, W)); sh, sw = int(round(H * s)), int(round(W * s))
@@ -119,17 +126,27 @@ def seg_engine_batch(engine, bgrs, seg_size, device, patch=14):
         sh, sw = H, W
     new_h = max(patch, int(round(sh / patch)) * patch)
     new_w = max(patch, int(round(sw / patch)) * patch)
+    _sync(); _t = time.perf_counter()
     ts = [_NORM(Image.fromarray(cv2.cvtColor(cv2.resize(b, (sw, sh)), cv2.COLOR_BGR2RGB)))
           for b in bgrs]
     x = torch.stack(ts).to(device)
     if (new_h, new_w) != (sh, sw):
         x = F.interpolate(x, (new_h, new_w), mode='bilinear', align_corners=True)
+    _sync()
+    if prof is not None:
+        prof['pre'] = prof.get('pre', 0.0) + (time.perf_counter() - _t); _t = time.perf_counter()
     with torch.inference_mode():
         logits = engine(x)                          # _HalfInputEngine casts to fp16
         lab = logits.argmax(1)
+        _sync()
+        if prof is not None:
+            prof['fwd'] = prof.get('fwd', 0.0) + (time.perf_counter() - _t); _t = time.perf_counter()
         if lab.shape[-2:] != (H, W):
             lab = F.interpolate(lab[:, None].float(), (H, W), mode='nearest')[:, 0]
         preds = lab.to(torch.uint8).cpu().numpy()
+    _sync()
+    if prof is not None:
+        prof['post'] = prof.get('post', 0.0) + (time.perf_counter() - _t)
     return [preds[i] for i in range(len(bgrs))]
 
 
@@ -221,10 +238,16 @@ def draw_reproj(img, xyz, K, D, rvec_cam, tvec_cam):
         return
     pr, _ = cv2.projectPoints(pts.reshape(-1, 1, 3), np.asarray(rvec_cam, float),
                               np.asarray(tvec_cam, float), np.asarray(K, float), np.asarray(D, float))
+    h, w = img.shape[:2]
     for (x, y) in pr.reshape(-1, 2):
         if not (np.isfinite(x) and np.isfinite(y)):
             continue
-        cv2.circle(img, (int(round(x)), int(round(y))), 9, (255, 255, 255), 1, cv2.LINE_AA)
+        if abs(x) > 1e6 or abs(y) > 1e6:
+            continue
+        xi, yi = int(round(float(x))), int(round(float(y)))
+        if xi < -32 or xi >= w + 32 or yi < -32 or yi >= h + 32:
+            continue
+        cv2.circle(img, (xi, yi), 9, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def main():
@@ -246,6 +269,9 @@ def main():
     p.add_argument('--needle-class', type=int, default=1)
     p.add_argument('--thread-class', type=int, default=2)
     p.add_argument('--seg-size', type=int, default=640, help='MUST match the engine export --seg-size')
+    p.add_argument('--stride', type=int, default=1,
+                   help='run segmentation+pose every Nth frame, reusing the last result on '
+                        'skipped frames (throughput knob for weak GPUs; >1 changes output). 1=every frame.')
     p.add_argument('--patch', type=int, default=14, help='backbone patch (DINOv2=14)')
     p.add_argument('--view-height', type=int, default=720, help='downscale L|R canvas (0=full)')
     p.add_argument('--sam2-tools', default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -255,6 +281,9 @@ def main():
     p.add_argument('--no-async', action='store_true')
     p.add_argument('--no-reproject', action='store_true')
     p.add_argument('--show', action='store_true')
+    p.add_argument('--profile', action='store_true',
+                   help='accumulate per-stage timing (read/pre/fwd/post/pose/draw) and '
+                        'print the breakdown at the end; adds CUDA syncs so absolute fps drops')
     p.add_argument('--save-video', default=None)
     p.add_argument('--save-results', default=None, help='JSONL: one record per frame')
     args = p.parse_args()
@@ -287,6 +316,9 @@ def main():
     writer = None
     WIN = 'engine-only stereo keypoints (q=quit)'
     fps = 0.0; fi = 0
+    prof = {} if args.profile else None
+    n_pose = 0
+    last_ml = last_mr = last_out = None       # --stride: reuse on skipped frames
     print('[engine-only] started' + ('' if not args.show else ' — press q to quit'))
 
     while True:
@@ -294,24 +326,35 @@ def main():
         L, R, stem = src.read()
         if L is None:
             break
-        ml, mr = seg_engine_batch(engine, [L, R], args.seg_size, device, args.patch)
-        needleL = ml == args.needle_class; needleR = mr == args.needle_class
-        threadL = ml == args.thread_class
-        out = None
-        if needleL.sum() >= 20 and needleR.sum() >= 20:
-            try:
-                out, _ = nk.process_frame(needleL, needleR, threadL, calib, args.num_keypoints,
-                                          model_radius=args.model_radius)
-            except Exception:
-                out = None
-        if pk is not None:
-            if out is not None:
-                ts, rs = pk.update(out['pose']['t'], out['pose']['rvec'])
-                out['pose']['t'] = list(map(float, ts))
-                out['pose']['rvec'] = list(map(float, rs))
-                out['pose']['R'] = cv2.Rodrigues(np.asarray(rs, float))[0].tolist()
-            else:
-                pk.coast()
+        if prof is not None:
+            prof['read'] = prof.get('read', 0.0) + (time.perf_counter() - t0)
+        run_seg = (last_ml is None) or (fi % max(1, args.stride) == 0)
+        if run_seg:
+            ml, mr = seg_engine_batch(engine, [L, R], args.seg_size, device, args.patch, prof)
+            needleL = ml == args.needle_class; needleR = mr == args.needle_class
+            threadL = ml == args.thread_class
+            out = None
+            _tp = time.perf_counter()
+            if needleL.sum() >= 20 and needleR.sum() >= 20:
+                try:
+                    out, _ = nk.process_frame(needleL, needleR, threadL, calib, args.num_keypoints,
+                                              model_radius=args.model_radius)
+                except Exception:
+                    out = None
+            if prof is not None:
+                prof['pose'] = prof.get('pose', 0.0) + (time.perf_counter() - _tp)
+                n_pose += 1
+            if pk is not None:
+                if out is not None:
+                    ts, rs = pk.update(out['pose']['t'], out['pose']['rvec'])
+                    out['pose']['t'] = list(map(float, ts))
+                    out['pose']['rvec'] = list(map(float, rs))
+                    out['pose']['R'] = cv2.Rodrigues(np.asarray(rs, float))[0].tolist()
+                else:
+                    pk.coast()
+            last_ml, last_mr, last_out = ml, mr, out
+        else:                                  # skipped frame: reuse last seg+pose (skips the GPU forward)
+            ml, mr, out = last_ml, last_mr, last_out
         dt = time.perf_counter() - t0
         fps = 0.9 * fps + 0.1 * (1.0 / max(dt, 1e-6)) if fps else 1.0 / max(dt, 1e-6)
 
@@ -329,6 +372,7 @@ def main():
                                      "needle": needle}) + '\n')
 
         if args.show or args.save_video:
+            _td = time.perf_counter()
             visL = overlay_segmentation(L, ml, args.needle_class, args.thread_class)
             visR = overlay_segmentation(R, mr, args.needle_class, args.thread_class)
             if out is not None:
@@ -364,8 +408,12 @@ def main():
                 writer.write(canvas)
             if args.show:
                 cv2.imshow(WIN, canvas)
+                if prof is not None:
+                    prof['draw'] = prof.get('draw', 0.0) + (time.perf_counter() - _td)
                 if (cv2.waitKey(1) & 0xFF) == ord('q'):
                     break
+            elif prof is not None:
+                prof['draw'] = prof.get('draw', 0.0) + (time.perf_counter() - _td)
         fi += 1
 
     src.release()
@@ -376,6 +424,20 @@ def main():
         print(f'[engine-only] results -> {args.save_results}')
     cv2.destroyAllWindows()
     print(f'[engine-only] done — {fi} frames, ~{fps:.1f} fps')
+    if prof is not None and fi > 0:
+        order = [('read', 'frame read (async q)'), ('pre', 'preprocess (PIL/resize/H2D)'),
+                 ('fwd', 'engine forward'), ('post', 'argmax/upscale/D2H'),
+                 ('pose', 'pose registration (CPU)'), ('draw', 'overlay/draw/imshow')]
+        total = sum(prof.get(k, 0.0) for k, _ in order)
+        print('[profile] per-frame breakdown (avg over '
+              f'{fi} frames; pose avg over {max(n_pose,1)} pose-frames):')
+        for k, label in order:
+            tot = prof.get(k, 0.0)
+            n = n_pose if k == 'pose' else fi
+            ms = 1000.0 * tot / max(n, 1)
+            pct = 100.0 * tot / total if total else 0.0
+            print(f'    {label:<28} {ms:7.2f} ms/frame   {pct:5.1f}%')
+        print(f'    {"SUM (serial, excl. overlap)":<28} {1000.0*total/fi:7.2f} ms/frame')
 
 
 if __name__ == '__main__':
